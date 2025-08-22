@@ -1,148 +1,186 @@
-<!DOCTYPE html><html lang="ru"><head>
-<meta charset="utf-8" />
-<title>Python Call Site</title>
-<style>
- body{font-family:sans-serif;} #rooms{margin-bottom:1rem;}
- video,audio{display:none;} .hidden{display:none;}
-</style>
-</head><body>
-<h1>Звонки</h1>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8" />
+    <title>Python Call Site</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 1em auto; }
+        #rooms { margin-bottom: 1rem; }
+        video, audio { display: none; }
+        .hidden { display: none; }
+        button { margin: 0.2em; padding: 0.5em; }
+        input { margin: 0.2em; padding: 0.4em; }
+    </style>
+</head>
+<body>
+    <h1>Звонки</h1>
 
-<div id="login">
-  Ваше имя: <input id="userName" placeholder="Имя"> 
-  Аватар: <input id="avatarUrl" placeholder="https://...jpg">
-  <button id="enterBtn">Войти</button>
-</div>
+    <div id="login">
+        Ваше имя: <input id="userName" placeholder="Имя">
+        <button id="enterBtn">Войти</button>
+    </div>
 
-<div id="main" class="hidden">
-  <section id="rooms"></section>
+    <div id="main" class="hidden">
+        <section id="rooms"></section>
 
-  <h2>Создать комнату</h2>
-  Название: <input id="roomName">
-  Пароль (опц.): <input id="roomPwd" type="password">
-  <button id="createRoom">Создать</button>
+        <h2>Создать комнату</h2>
+        Название: <input id="roomName">
+        Пароль (опц.): <input id="roomPwd" type="password">
+        <button id="createRoom">Создать</button>
 
-  <h2 id="roomTitle" class="hidden">Комната: <span id="currentRoom"></span></h2>
-  <div id="controls" class="hidden">
-    <button id="leave">Выйти</button>
-    <button id="muteMic">Микрофон выкл.</button>
-    <button id="muteSpk">Динамики выкл.</button><br/>
-    Громкость вход.: <input id="inVol" type="range" min="0" max="250" value="100">
-    Микрофон:       <input id="outVol" type="range" min="0" max="250" value="100">
-  </div>
-</div>
+        <h2 id="roomTitle" class="hidden">Комната: <span id="currentRoom"></span></h2>
+        <div id="controls" class="hidden">
+            <button id="leave">Выйти</button>
+            <button id="muteMic">Микрофон выкл.</button>
+            <button id="muteSpk">Динамики выкл.</button><br />
+            Громкость вход.: <input id="inVol" type="range" min="0" max="250" value="100">
+            Микрофон: <input id="outVol" type="range" min="0" max="250" value="100">
+        </div>
+    </div>
 
 <script>
-let token={}, ws=null, pc=null, localStream=null,
-    roomsDiv=document.getElementById('rooms');
+let token = {}, ws = null, pc = null, localStream = null,
+    roomsDiv = document.getElementById('rooms');
 
 const gainCtx = new AudioContext();
 let inGain = gainCtx.createGain();
 let micGain = gainCtx.createGain();
 
-document.getElementById('enterBtn').onclick = ()=>{
-  token.name = userName.value || 'Гость'+Math.random().toString(36).slice(2,5);
-  token.avatar = avatarUrl.value || 'https://placekitten.com/64/64';
-  login.classList.add('hidden'); main.classList.remove('hidden');
-  loadRooms();
+document.getElementById('enterBtn').onclick = () => {
+    token.name = userName.value || 'Гость' + Math.random().toString(36).slice(2, 5);
+    login.classList.add('hidden');
+    main.classList.remove('hidden');
+    loadRooms();
 };
-document.getElementById('createRoom').onclick = async ()=>{
-  const r = await fetch('/api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:roomName.value,password:roomPwd.value})});
-  if(r.ok){roomName.value='';roomPwd.value='';loadRooms();}
-  else alert(await r.text());
-};
-async function loadRooms(){
-  roomsDiv.innerHTML='Загрузка...';
-  const lst=await (await fetch('/api/rooms')).json();
-  roomsDiv.innerHTML = lst.map(r=>
-    `<button onclick="join(${r.id},'${r.name}',${r.has_password})">
-       Войти: ${r.name}${r.has_password?' 🔒':''}</button>`).join('<br>');
-}
-window.join = async (id,name,hasPwd)=>{
- if(ws){alert('Уже в комнате');return;}
- const pwd = hasPwd?prompt('Пароль'):'';
 
- ws = new WebSocket(`ws://${location.host}/ws/${id}`);
-
- // Устанавливаем обработчики ДО открытия соединения
- ws.onmessage = e=> handleSignal(JSON.parse(e.data));
- ws.onclose = (event) => {
-    console.log('WebSocket closed:', event.code, event.reason);
-    if (event.code === 4000) {
-        alert('Неправильный пароль или ошибка аутентификации.');
+document.getElementById('createRoom').onclick = async () => {
+    const r = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: roomName.value, password: roomPwd.value })
+    });
+    if (r.ok) {
+        roomName.value = ''; roomPwd.value = '';
+        loadRooms();
+    } else {
+        alert(await r.text());
     }
-    cleanup();
- };
- ws.onerror = (error) => {
-    console.error('WebSocket Error:', error);
-    alert('Ошибка соединения с сервером.');
-    cleanup();
- };
-
- // Ждем, пока соединение установится
- await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject; // Добавляем обработку ошибок при открытии
- });
-
- // Отправляем сообщение с паролем как ПЕРВОЕ сообщение
- await ws.send(JSON.stringify({password: pwd}));
-
- // Если аутентификация не прошла, сервер закроет соединение,
- // и дальнейший код не будет выполнен, так как сработает ws.onclose.
-
- roomTitle.classList.remove('hidden'); controls.classList.remove('hidden');
- currentRoom.textContent = name;
- await startMedia();
-
- pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
- pc.onicecandidate = ({candidate})=> candidate && ws.send(JSON.stringify({ice:candidate}));
- pc.ontrack = ({streams:[s]})=>{
-   // входящий аудиопоток → WebAudio GainNode → destination
-   const src=gainCtx.createMediaStreamSource(s);
-   src.connect(inGain).connect(gainCtx.destination);
- };
- // микрофон → micGain → peer
- // micGain.stream гарантированно содержит трек после startMedia
- pc.addTrack(micGain.stream.getAudioTracks()[0], localStream);
- 
- inGain.gain.value=1; micGain.gain.value=1;
-
- // инициатор
- const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
- // Отправляем SDP предложение ПОСЛЕ успешной отправки пароля
- ws.send(JSON.stringify({sdp:pc.localDescription}));
 };
-async function handleSignal(msg){
- if(msg.sdp){
-   await pc.setRemoteDescription(msg.sdp);
-   if(msg.sdp.type==='offer'){
-       const ans=await pc.createAnswer(); await pc.setLocalDescription(ans);
-       ws.send(JSON.stringify({sdp:pc.localDescription}));
-   }
- }else if(msg.ice){ await pc.addIceCandidate(msg.ice); }
+
+async function loadRooms() {
+    roomsDiv.innerHTML = 'Загрузка...';
+    const lst = await (await fetch('/api/rooms')).json();
+    roomsDiv.innerHTML = lst.map(r =>
+        `<button onclick="join(${r.id},'${r.name}',${r.has_password})">
+       Войти: ${r.name}${r.has_password ? ' 🔒' : ''}</button>`).join('<br>');
 }
-async function startMedia(){
-  localStream = await navigator.mediaDevices.getUserMedia({audio:true});
-  const dest = gainCtx.createMediaStreamDestination(); // для регулировки микрофона
-  const src = gainCtx.createMediaStreamSource(localStream);
-  src.connect(micGain).connect(dest);
-  micGain.stream = dest.stream; // Важно: micGain.stream теперь содержит управляемый поток
+
+// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ВХОДА В КОМНАТУ ---
+window.join = async (id, name, hasPwd) => {
+    if (ws) { alert('Уже в комнате'); return; }
+    const pwd = hasPwd ? prompt('Пароль для комнаты "' + name + '"') : '';
+    // Если пользователь нажал "Отмена" в окне ввода пароля
+    if (hasPwd && pwd === null) return;
+
+    ws = new WebSocket(`ws://${location.host}/ws/${id}`);
+
+    try {
+        // Устанавливаем обработчики ДО открытия соединения
+        ws.onmessage = e => handleSignal(JSON.parse(e.data));
+        ws.onclose = (event) => {
+            console.log('WebSocket closed:', event.code, event.reason);
+            if (event.code === 4000) {
+                alert('Неправильный пароль.');
+            } else if (event.code > 1001) {
+                alert(`Соединение закрыто с ошибкой: ${event.reason}`);
+            }
+            cleanup();
+        };
+
+        // Ждем, пока соединение установится
+        await new Promise((resolve, reject) => {
+            ws.onopen = resolve;
+            ws.onerror = (err) => reject(new Error("Ошибка WebSocket соединения."));
+        });
+
+        // Отправляем пароль как ПЕРВОЕ сообщение
+        ws.send(JSON.stringify({ password: pwd }));
+
+        // Показываем UI, чтобы пользователь видел прогресс
+        roomTitle.classList.remove('hidden');
+        controls.classList.remove('hidden');
+        currentRoom.textContent = name;
+
+        // Запрашиваем доступ к медиа-устройствам
+        await startMedia();
+
+        // Настраиваем WebRTC соединение
+        pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        pc.onicecandidate = ({ candidate }) => candidate && ws.send(JSON.stringify({ ice: candidate }));
+        pc.ontrack = ({ streams: [s] }) => {
+            const src = gainCtx.createMediaStreamSource(s);
+            src.connect(inGain).connect(gainCtx.destination);
+        };
+        // Добавляем наш аудиопоток в соединение
+        pc.addTrack(micGain.stream.getAudioTracks()[0], localStream);
+        inGain.gain.value = 1; micGain.gain.value = 1;
+
+        // Создаем и отправляем SDP offer
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ sdp: pc.localDescription }));
+
+    } catch (err) {
+        console.error("Не удалось войти в комнату:", err);
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+            alert('Ошибка: Вы не разрешили доступ к микрофону.');
+        } else {
+            alert(`Произошла ошибка при входе: ${err.message}`);
+        }
+        ws?.close(); // Закрываем сокет, если он успел открыться
+        cleanup();   // Сбрасываем состояние
+    }
+};
+
+async function handleSignal(msg) {
+    if (!pc) return; // Игнорируем сигналы, если мы не в процессе звонка
+    if (msg.sdp) {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        if (msg.sdp.type === 'offer') {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            ws.send(JSON.stringify({ sdp: pc.localDescription }));
+        }
+    } else if (msg.ice) {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.ice));
+    }
 }
-function cleanup(){
-  pc&&pc.close(); pc=null; ws=null;
-  if (localStream) {
-    localStream.getTracks().forEach(track => track.stop());
-    localStream = null;
-  }
-  roomTitle.classList.add('hidden'); controls.classList.add('hidden');
-  currentRoom.textContent = ''; // Очищаем название комнаты
+
+async function startMedia() {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const dest = gainCtx.createMediaStreamDestination();
+    const src = gainCtx.createMediaStreamSource(localStream);
+    src.connect(micGain).connect(dest);
+    micGain.stream = dest.stream; // Сохраняем поток с регулировкой громкости
 }
-leave.onclick = ()=>{ ws?.close(); cleanup(); };
-muteMic.onclick = ()=> localStream.getAudioTracks()[0].enabled ^= true;
-muteSpk.onclick = ()=> inGain.gain.value = inGain.gain.value?0:1;
-inVol.oninput = e=> inGain.gain.value = e.target.value/100 * 2.5;   // 0–2.5 (0–250 %)
-outVol.oninput= e=> micGain.gain.value = e.target.value/100 * 2.5;
+
+function cleanup() {
+    pc?.close(); pc = null;
+    ws = null; // ws?.close() вызовет cleanup, поэтому просто обнуляем
+    if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+        localStream = null;
+    }
+    roomTitle.classList.add('hidden');
+    controls.classList.add('hidden');
+    currentRoom.textContent = '';
+}
+
+leave.onclick = () => { ws?.close(); };
+muteMic.onclick = () => { if(localStream) localStream.getAudioTracks()[0].enabled ^= true; };
+muteSpk.onclick = () => { inGain.gain.value = inGain.gain.value ? 0 : 1; };
+inVol.oninput = e => inGain.gain.value = e.target.value / 100 * 2.5;
+outVol.oninput = e => micGain.gain.value = e.target.value / 100 * 2.5;
 </script>
-</body></html>
+</body>
+</html>
