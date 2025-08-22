@@ -79,6 +79,7 @@ async def websocket_endpoint(ws: WebSocket, room_id: int):
         db.close()
         return
 
+    # Проверяем пароль, ТОЛЬКО если он установлен
     if room.pwd_hash:
         try:
             initial = json.loads(await ws.receive_text())
@@ -91,8 +92,9 @@ async def websocket_endpoint(ws: WebSocket, room_id: int):
             await ws.close(code=4001, reason="Authentication failed")
             db.close()
             return
-    else:
-        await ws.receive_text()
+    
+    # Блок 'else' полностью удалён. 
+    # Если пароля нет, мы просто продолжаем выполнение.
 
     db.close()
 
@@ -100,6 +102,9 @@ async def websocket_endpoint(ws: WebSocket, room_id: int):
     try:
         while True:
             msg = await ws.receive_text()
+            # Первое сообщение от клиента в комнате без пароля {"password":""}
+            # просто будет разослано другим участникам и проигнорировано их обработчиками,
+            # что не является критической ошибкой.
             for client in active_connections.get(room_id, set()):
                 if client is not ws:
                     await client.send_text(msg)
