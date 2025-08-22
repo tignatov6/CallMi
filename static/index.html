@@ -62,10 +62,35 @@ async function loadRooms(){
 window.join = async (id,name,hasPwd)=>{
  if(ws){alert('Уже в комнате');return;}
  const pwd = hasPwd?prompt('Пароль'):'';
+
  ws = new WebSocket(`ws://${location.host}/ws/${id}`);
- ws.onopen = ()=> ws.send(JSON.stringify({password:pwd}));
+
+ // Устанавливаем обработчики ДО открытия соединения
  ws.onmessage = e=> handleSignal(JSON.parse(e.data));
- ws.onclose = ()=> cleanup();
+ ws.onclose = (event) => {
+    console.log('WebSocket closed:', event.code, event.reason);
+    if (event.code === 4000) {
+        alert('Неправильный пароль или ошибка аутентификации.');
+    }
+    cleanup();
+ };
+ ws.onerror = (error) => {
+    console.error('WebSocket Error:', error);
+    alert('Ошибка соединения с сервером.');
+    cleanup();
+ };
+
+ // Ждем, пока соединение установится
+ await new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = reject; // Добавляем обработку ошибок при открытии
+ });
+
+ // Отправляем сообщение с паролем как ПЕРВОЕ сообщение
+ await ws.send(JSON.stringify({password: pwd}));
+
+ // Если аутентификация не прошла, сервер закроет соединение,
+ // и дальнейший код не будет выполнен, так как сработает ws.onclose.
 
  roomTitle.classList.remove('hidden'); controls.classList.remove('hidden');
  currentRoom.textContent = name;
@@ -79,12 +104,15 @@ window.join = async (id,name,hasPwd)=>{
    src.connect(inGain).connect(gainCtx.destination);
  };
  // микрофон → micGain → peer
- localStream.getTracks().forEach(t=>pc.addTrack(micGain.stream.getAudioTracks()[0]??t, localStream));
+ // micGain.stream гарантированно содержит трек после startMedia
+ pc.addTrack(micGain.stream.getAudioTracks()[0], localStream);
+ 
  inGain.gain.value=1; micGain.gain.value=1;
 
  // инициатор
  const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
- ws.onopen = ()=> ws.send(JSON.stringify({sdp:pc.localDescription}));
+ // Отправляем SDP предложение ПОСЛЕ успешной отправки пароля
+ ws.send(JSON.stringify({sdp:pc.localDescription}));
 };
 async function handleSignal(msg){
  if(msg.sdp){
@@ -100,11 +128,16 @@ async function startMedia(){
   const dest = gainCtx.createMediaStreamDestination(); // для регулировки микрофона
   const src = gainCtx.createMediaStreamSource(localStream);
   src.connect(micGain).connect(dest);
-  micGain.stream = dest.stream;
+  micGain.stream = dest.stream; // Важно: micGain.stream теперь содержит управляемый поток
 }
 function cleanup(){
   pc&&pc.close(); pc=null; ws=null;
+  if (localStream) {
+    localStream.getTracks().forEach(track => track.stop());
+    localStream = null;
+  }
   roomTitle.classList.add('hidden'); controls.classList.add('hidden');
+  currentRoom.textContent = ''; // Очищаем название комнаты
 }
 leave.onclick = ()=>{ ws?.close(); cleanup(); };
 muteMic.onclick = ()=> localStream.getAudioTracks()[0].enabled ^= true;
