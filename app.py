@@ -36,7 +36,7 @@ app = FastAPI()
 # Замените ваш код index.html на тот, что будет ниже
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    with open("index.html", "r", encoding="utf-8") as f:
+    with open("static/index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 def get_db():
