@@ -77,6 +77,8 @@ async function loadRooms() {
 
 // --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ВХОДА В КОМНАТУ ---
 window.join = async (id, name, hasPwd) => {
+    if (gainCtx.state === 'suspended') { gainCtx.resume(); }
+    
     if (ws) { alert('Уже в комнате'); return; }
     const pwd = hasPwd ? prompt('Пароль для комнаты "' + name + '"') : '';
     // Если пользователь нажал "Отмена" в окне ввода пароля
