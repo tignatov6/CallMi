@@ -1,10 +1,10 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-import hashlib, secrets, json
+import hashlib
+import json
 
 DATABASE_URL = "sqlite:///./rooms.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -15,7 +15,7 @@ Base = declarative_base()
 class Room(Base):
     __tablename__ = "rooms"
     id       = Column(Integer, primary_key=True, index=True)
-    name     = Column(String, unique=True)
+    name     = Column(String, unique=True, index=True)
     pwd_hash = Column(String, nullable=True)        # sha256 || None
 
 Base.metadata.create_all(bind=engine)
@@ -32,7 +32,12 @@ class RoomPublic(BaseModel):
 
 # ── FastAPI app ─────────────────────────────────────────────────────────
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+# Замените ваш код index.html на тот, что будет ниже
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
 
 def get_db():
     db = SessionLocal()
@@ -62,23 +67,52 @@ active_connections: dict[int, set[WebSocket]] = {}
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(ws: WebSocket, room_id: int):
     await ws.accept()
-    # аутентификация паролем (если требуется)
-    initial = json.loads(await ws.receive_text())
-    if 'password' in initial:
-        db: Session = SessionLocal()
-        room = db.get(Room, room_id)
+    
+    # --- УЛУЧШЕННАЯ И БЕЗОПАСНАЯ ЛОГИКА АУТЕНТИФИКАЦИИ ---
+    db = SessionLocal()
+    room = db.get(Room, room_id)
+    
+    # Если комната не найдена
+    if not room:
+        await ws.close(code=4004, reason="Room not found")
         db.close()
-        if room and room.pwd_hash and room.pwd_hash != hashlib.sha256(initial['password'].encode()).hexdigest():
-            await ws.close(code=4000)
+        return
+
+    # Если у комнаты есть пароль, мы ОБЯЗАТЕЛЬНО ждем его от клиента
+    if room.pwd_hash:
+        try:
+            initial = json.loads(await ws.receive_text())
+            client_pwd_hash = hashlib.sha256(initial.get('password', '').encode()).hexdigest()
+
+            if room.pwd_hash != client_pwd_hash:
+                await ws.close(code=4000, reason="Incorrect password")
+                db.close()
+                return
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            # Если клиент отправил невалидный JSON или вообще не то
+            await ws.close(code=4001, reason="Authentication failed")
+            db.close()
             return
-    # регистрируем соединение
+    else:
+        # Если пароля нет, мы все равно должны "потребить" первое сообщение от клиента,
+        # чтобы оно не мешало дальнейшему WebRTC-сигналингу.
+        await ws.receive_text()
+
+    db.close()
+    # -----------------------------------------------------------
+
+    # Регистрируем соединение
     active_connections.setdefault(room_id, set()).add(ws)
     try:
         while True:
             msg = await ws.receive_text()
-            # просто ретранслируем json-строку всем остальным в комнате
-            for client in active_connections[room_id]:
+            # Ретранслируем json-строку всем остальным в комнате
+            for client in active_connections.get(room_id, set()):
                 if client is not ws:
                     await client.send_text(msg)
     except WebSocketDisconnect:
-        active_connections[room_id].remove(ws)
+        # Улучшенная очистка: удаляем пустые комнаты из словаря
+        if room_id in active_connections:
+            active_connections[room_id].remove(ws)
+            if not active_connections[room_id]:
+                del active_connections[room_id]
