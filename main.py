@@ -1,3 +1,5 @@
+# Файл: main.py
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -16,7 +18,7 @@ class Room(Base):
     __tablename__ = "rooms"
     id       = Column(Integer, primary_key=True, index=True)
     name     = Column(String, unique=True, index=True)
-    pwd_hash = Column(String, nullable=True)        # sha256 || None
+    pwd_hash = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -33,10 +35,11 @@ class RoomPublic(BaseModel):
 # ── FastAPI app ─────────────────────────────────────────────────────────
 app = FastAPI()
 
-# Замените ваш код index.html на тот, что будет ниже
+# УБЕДИТЕСЬ, ЧТО У ВАС НЕТ СТРОКИ app.mount("/static", ...)
+# Оставляем ТОЛЬКО этот способ для отдачи главной страницы.
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    with open("static/index.html", "r", encoding="utf-8") as f:
+    with open("index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 def get_db():
@@ -68,50 +71,39 @@ active_connections: dict[int, set[WebSocket]] = {}
 async def websocket_endpoint(ws: WebSocket, room_id: int):
     await ws.accept()
     
-    # --- УЛУЧШЕННАЯ И БЕЗОПАСНАЯ ЛОГИКА АУТЕНТИФИКАЦИИ ---
     db = SessionLocal()
     room = db.get(Room, room_id)
     
-    # Если комната не найдена
     if not room:
         await ws.close(code=4004, reason="Room not found")
         db.close()
         return
 
-    # Если у комнаты есть пароль, мы ОБЯЗАТЕЛЬНО ждем его от клиента
     if room.pwd_hash:
         try:
             initial = json.loads(await ws.receive_text())
             client_pwd_hash = hashlib.sha256(initial.get('password', '').encode()).hexdigest()
-
             if room.pwd_hash != client_pwd_hash:
                 await ws.close(code=4000, reason="Incorrect password")
                 db.close()
                 return
         except (json.JSONDecodeError, KeyError, AttributeError):
-            # Если клиент отправил невалидный JSON или вообще не то
             await ws.close(code=4001, reason="Authentication failed")
             db.close()
             return
     else:
-        # Если пароля нет, мы все равно должны "потребить" первое сообщение от клиента,
-        # чтобы оно не мешало дальнейшему WebRTC-сигналингу.
         await ws.receive_text()
 
     db.close()
-    # -----------------------------------------------------------
 
-    # Регистрируем соединение
     active_connections.setdefault(room_id, set()).add(ws)
     try:
         while True:
             msg = await ws.receive_text()
-            # Ретранслируем json-строку всем остальным в комнате
             for client in active_connections.get(room_id, set()):
                 if client is not ws:
                     await client.send_text(msg)
     except WebSocketDisconnect:
-        # Улучшенная очистка: удаляем пустые комнаты из словаря
         if room_id in active_connections:
             active_connections[room_id].remove(ws)
             if not active_connections[room_id]:
