@@ -6,10 +6,11 @@
     <style>
         body { font-family: sans-serif; max-width: 800px; margin: 1em auto; }
         #rooms { margin-bottom: 1rem; }
-        video, audio { display: none; }
+        #audio-container, video { display: none; }
         .hidden { display: none; }
         button { margin: 0.2em; padding: 0.5em; }
         input { margin: 0.2em; padding: 0.4em; }
+        #usersList { border: 1px solid #ccc; padding: 0.5em; min-height: 50px; margin-top: 1em; }
     </style>
 </head>
 <body>
@@ -28,26 +29,29 @@
         Пароль (опц.): <input id="roomPwd" type="password">
         <button id="createRoom">Создать</button>
 
-        <h2 id="roomTitle" class="hidden">Комната: <span id="currentRoom"></span></h2>
-        <div id="controls" class="hidden">
-            <button id="leave">Выйти</button>
-            <button id="muteMic">Микрофон выкл.</button>
-            <button id="muteSpk">Динамики выкл.</button><br />
-            Громкость вход.: <input id="inVol" type="range" min="0" max="250" value="100">
-            Микрофон: <input id="outVol" type="range" min="0" max="250" value="100">
+        <div id="callUI" class="hidden">
+            <h2 id="roomTitle">Комната: <span id="currentRoom"></span></h2>
+            <h3>Участники:</h3>
+            <div id="usersList"></div>
+            <div id="controls">
+                <button id="leave">Выйти</button>
+                <button id="muteMic">Микрофон выкл.</button>
+                <!-- Функционал MuteSpk и громкости убран для простоты, т.к. аудио теперь управляется динамически -->
+            </div>
         </div>
     </div>
+    
+    <div id="audio-container"></div>
 
 <script>
-let token = {}, ws = null, pc = null, localStream = null,
-    roomsDiv = document.getElementById('rooms');
+let myPeerId = null, myName = null, ws = null, localStream = null;
+let peerConnections = {}; // { peerId: RTCPeerConnection }
+const roomsDiv = document.getElementById('rooms');
 
-const gainCtx = new AudioContext();
-let inGain = gainCtx.createGain();
-let micGain = gainCtx.createGain();
-
+// --- Вход и создание комнат (без существенных изменений) ---
 document.getElementById('enterBtn').onclick = () => {
-    token.name = userName.value || 'Гость' + Math.random().toString(36).slice(2, 5);
+    myName = userName.value || 'Гость' + Math.random().toString(36).slice(2, 5);
+    myPeerId = `peer_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`; // Генерируем уникальный ID
     login.classList.add('hidden');
     main.classList.remove('hidden');
     loadRooms();
@@ -62,9 +66,7 @@ document.getElementById('createRoom').onclick = async () => {
     if (r.ok) {
         roomName.value = ''; roomPwd.value = '';
         loadRooms();
-    } else {
-        alert(await r.text());
-    }
+    } else { alert(await r.text()); }
 };
 
 async function loadRooms() {
@@ -75,63 +77,45 @@ async function loadRooms() {
        Войти: ${r.name}${r.has_password ? ' 🔒' : ''}</button>`).join('<br>');
 }
 
-// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ВХОДА В КОМНАТУ ---
-window.join = async (id, name, hasPwd) => {
-    if (gainCtx.state === 'suspended') { gainCtx.resume(); }
-    
-    if (ws) { alert('Уже в комнате'); return; }
-    const pwd = hasPwd ? prompt('Пароль для комнаты "' + name + '"') : '';
-    // Если пользователь нажал "Отмена" в окне ввода пароля
-    if (hasPwd && pwd === null) return;
 
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${id}`);
+// --- НОВАЯ ЛОГИКА ПОДКЛЮЧЕНИЯ И WEBRTC ---
+
+window.join = async (id, name, hasPwd) => {
+    if (ws) { alert('Уже в комнате'); return; }
+    let pwd = '';
+    if (hasPwd) {
+        pwd = prompt('Пароль для комнаты "' + name + '"');
+        if (pwd === null) return; // Пользователь нажал "Отмена"
+    }
 
     try {
-        // Устанавливаем обработчики ДО открытия соединения
-        ws.onmessage = e => handleSignal(JSON.parse(e.data));
+        await startMedia(); // Запрашиваем микрофон заранее
+
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${wsProtocol}//${location.host}/ws/${id}/${myPeerId}/${encodeURIComponent(myName)}${pwd ? '?password=' + encodeURIComponent(pwd) : ''}`;
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            console.log("WebSocket connection established");
+            callUI.classList.remove('hidden');
+            currentRoom.textContent = name;
+        };
+        
+        ws.onmessage = e => handleWsMessage(JSON.parse(e.data));
+        
         ws.onclose = (event) => {
             console.log('WebSocket closed:', event.code, event.reason);
-            if (event.code === 4000) {
-                alert('Неправильный пароль.');
-            } else if (event.code > 1001) {
-                alert(`Соединение закрыто с ошибкой: ${event.reason}`);
+            if (event.code >= 4000) {
+                alert(`Не удалось подключиться: ${event.reason}`);
             }
             cleanup();
         };
-
-        // Ждем, пока соединение установится
-        await new Promise((resolve, reject) => {
-            ws.onopen = resolve;
-            ws.onerror = (err) => reject(new Error("Ошибка WebSocket соединения."));
-        });
-
-        // Отправляем пароль как ПЕРВОЕ сообщение
-        ws.send(JSON.stringify({ password: pwd }));
-
-        // Показываем UI, чтобы пользователь видел прогресс
-        roomTitle.classList.remove('hidden');
-        controls.classList.remove('hidden');
-        currentRoom.textContent = name;
-
-        // Запрашиваем доступ к медиа-устройствам
-        await startMedia();
-
-        // Настраиваем WebRTC соединение
-        pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-        pc.onicecandidate = ({ candidate }) => candidate && ws.send(JSON.stringify({ ice: candidate }));
-        pc.ontrack = ({ streams: [s] }) => {
-            const src = gainCtx.createMediaStreamSource(s);
-            src.connect(inGain).connect(gainCtx.destination);
+        
+        ws.onerror = (err) => {
+            console.error("WebSocket error:", err);
+            alert("Произошла ошибка WebSocket соединения.");
+            cleanup();
         };
-        // Добавляем наш аудиопоток в соединение
-        pc.addTrack(micGain.stream.getAudioTracks()[0], localStream);
-        inGain.gain.value = 1; micGain.gain.value = 1;
-
-        // Создаем и отправляем SDP offer
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        ws.send(JSON.stringify({ sdp: pc.localDescription }));
 
     } catch (err) {
         console.error("Не удалось войти в комнату:", err);
@@ -140,50 +124,153 @@ window.join = async (id, name, hasPwd) => {
         } else {
             alert(`Произошла ошибка при входе: ${err.message}`);
         }
-        ws?.close(); // Закрываем сокет, если он успел открыться
-        cleanup();   // Сбрасываем состояние
+        cleanup();
     }
 };
 
-async function handleSignal(msg) {
-    if (!pc) return; // Игнорируем сигналы, если мы не в процессе звонка
-    if (msg.sdp) {
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        if (msg.sdp.type === 'offer') {
-            const ans = await pc.createAnswer();
-            await pc.setLocalDescription(ans);
-            ws.send(JSON.stringify({ sdp: pc.localDescription }));
-        }
-    } else if (msg.ice) {
-        await pc.addIceCandidate(new RTCIceCandidate(msg.ice));
+async function handleWsMessage(msg) {
+    console.log("Received message:", msg);
+    const { type, payload, from_id } = msg;
+
+    switch (type) {
+        // Сервер сообщил нам, кто уже есть в комнате
+        case 'room_state':
+            updateUsersList(payload.concat({id: myPeerId, name: `${myName} (Вы)`}));
+            // Создаем соединение с каждым существующим пиром и отправляем offer
+            for (const peer of payload) {
+                const pc = createPeerConnection(peer.id, peer.name);
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                ws.send(JSON.stringify({ to_id: peer.id, type: 'sdp', payload: pc.localDescription }));
+            }
+            break;
+
+        // В комнату вошел новый участник
+        case 'new_peer':
+            updateUsersList(null, payload);
+            // Новый участник создаст offer, мы просто создаем PC и ждем
+            createPeerConnection(payload.id, payload.name);
+            break;
+
+        // Участник покинул комнату
+        case 'peer_left':
+            updateUsersList(null, null, payload.id);
+            if (peerConnections[payload.id]) {
+                peerConnections[payload.id].close();
+                delete peerConnections[payload.id];
+            }
+            const audioEl = document.getElementById(`audio_${payload.id}`);
+            if (audioEl) audioEl.remove();
+            break;
+
+        // Получили SDP (offer или answer)
+        case 'sdp':
+            const pc = peerConnections[from_id];
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(payload));
+                if (payload.type === 'offer') {
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify({ to_id: from_id, type: 'sdp', payload: pc.localDescription }));
+                }
+            }
+            break;
+
+        // Получили ICE-кандидат
+        case 'ice':
+            await peerConnections[from_id]?.addIceCandidate(new RTCIceCandidate(payload));
+            break;
     }
 }
 
+function createPeerConnection(peerId, peerName) {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    
+    pc.onicecandidate = ({ candidate }) => {
+        if (candidate) {
+            ws.send(JSON.stringify({ to_id: peerId, type: 'ice', payload: candidate }));
+        }
+    };
+    
+    pc.ontrack = ({ streams: [stream] }) => {
+        let audioEl = document.getElementById(`audio_${peerId}`);
+        if (!audioEl) {
+            audioEl = document.createElement('audio');
+            audioEl.id = `audio_${peerId}`;
+            audioEl.autoplay = true;
+            audioEl.playsInline = true;
+            document.getElementById('audio-container').appendChild(audioEl);
+        }
+        audioEl.srcObject = stream;
+        console.log(`Получен аудипоток от ${peerName} (${peerId})`);
+    };
+
+    // Добавляем наши аудиотреки в соединение
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+    peerConnections[peerId] = pc;
+    console.log(`Создано PeerConnection для ${peerName} (${peerId})`);
+    return pc;
+}
+
+// --- Вспомогательные функции ---
+
+let currentUsers = [];
+function updateUsersList(fullList, newUser, removedUserId) {
+    if (fullList) {
+        currentUsers = fullList;
+    } else if (newUser) {
+        currentUsers.push(newUser);
+    } else if (removedUserId) {
+        currentUsers = currentUsers.filter(u => u.id !== removedUserId);
+    }
+    
+    usersList.innerHTML = currentUsers.map(u => `<div>${u.name}</div>`).join('');
+}
+
+
 async function startMedia() {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const dest = gainCtx.createMediaStreamDestination();
-    const src = gainCtx.createMediaStreamSource(localStream);
-    src.connect(micGain).connect(dest);
-    micGain.stream = dest.stream; // Сохраняем поток с регулировкой громкости
+    if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
 }
 
 function cleanup() {
-    pc?.close(); pc = null;
-    ws = null; // ws?.close() вызовет cleanup, поэтому просто обнуляем
-    if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-        localStream = null;
+    // Закрываем все WebRTC соединения
+    for (const peerId in peerConnections) {
+        peerConnections[peerId].close();
     }
-    roomTitle.classList.add('hidden');
-    controls.classList.add('hidden');
+    peerConnections = {};
+
+    // Закрываем WebSocket, если он еще открыт
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+        ws.onmessage = null; // убираем обработчики, чтобы избежать ошибок при закрытии
+        ws.onclose = null;
+        ws.close();
+    }
+    ws = null;
+    
+    // Останавливаем захват микрофона
+    localStream?.getTracks().forEach(track => track.stop());
+    localStream = null;
+
+    // Скрываем UI звонка
+    callUI.classList.add('hidden');
     currentRoom.textContent = '';
+    usersList.innerHTML = '';
+    document.getElementById('audio-container').innerHTML = '';
+    currentUsers = [];
 }
 
-leave.onclick = () => { ws?.close(); };
-muteMic.onclick = () => { if(localStream) localStream.getAudioTracks()[0].enabled ^= true; };
-muteSpk.onclick = () => { inGain.gain.value = inGain.gain.value ? 0 : 1; };
-inVol.oninput = e => inGain.gain.value = e.target.value / 100 * 2.5;
-outVol.oninput = e => micGain.gain.value = e.target.value / 100 * 2.5;
+leave.onclick = () => { cleanup(); };
+muteMic.onclick = () => {
+    if(localStream) {
+        const enabled = localStream.getAudioTracks()[0].enabled;
+        localStream.getAudioTracks()[0].enabled = !enabled;
+        muteMic.textContent = enabled ? "Микрофон вкл." : "Микрофон выкл.";
+    }
+};
+
 </script>
 </body>
 </html>
