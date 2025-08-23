@@ -21,7 +21,7 @@ class Config:
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./rooms.db")
     
     # Room management settings
-    ROOM_CLEANUP_TIMEOUT_SECONDS: int = int(os.getenv("ROOM_CLEANUP_TIMEOUT_SECONDS", "300"))  # 15 seconds default
+    ROOM_CLEANUP_TIMEOUT_SECONDS: int = int(os.getenv("ROOM_CLEANUP_TIMEOUT_SECONDS", "900"))  # 15 seconds default
     ROOM_CLEANUP_INTERVAL_SECONDS: int = int(os.getenv("ROOM_CLEANUP_INTERVAL_SECONDS", "60"))  # Check every 10 seconds
     
     # Auto-refresh intervals (in seconds)
@@ -59,4 +59,5 @@ def get_config_bool(key: str, default: bool) -> bool:
 
 def get_config_str(key: str, default: str) -> str:
     """Get string configuration value with fallback to default"""
+
     return os.getenv(key, default)
