@@ -11,6 +11,62 @@
         button { margin: 0.2em; padding: 0.5em; }
         input { margin: 0.2em; padding: 0.4em; }
         #usersList { border: 1px solid #ccc; padding: 0.5em; min-height: 50px; margin-top: 1em; }
+        
+        /* Стили для индикатора громкости */
+        .user-item {
+            display: flex;
+            align-items: center;
+            padding: 8px;
+            margin: 4px 0;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            background: #f9f9f9;
+        }
+        
+        .user-name {
+            font-weight: bold;
+            margin-right: 10px;
+            min-width: 120px;
+        }
+        
+        .volume-indicator {
+            flex: 1;
+            height: 20px;
+            background: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+            margin: 0 10px;
+        }
+        
+        .volume-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50 0%, #FFC107 70%, #F44336 100%);
+            width: 0%;
+            transition: width 0.1s ease;
+            border-radius: 10px;
+        }
+        
+        .volume-text {
+            font-size: 12px;
+            color: #666;
+            min-width: 60px;
+            text-align: right;
+        }
+        
+        .speaking {
+            background: #e8f5e8;
+            border-color: #4CAF50;
+        }
+        
+        .muted {
+            opacity: 0.6;
+            background: #f0f0f0;
+        }
+        
+        .muted .volume-bar {
+            background: #999;
+        }
     </style>
 </head>
 <body>
@@ -23,6 +79,7 @@
 
     <div id="main" class="hidden">
         <section id="rooms"></section>
+        <button id="refreshRooms" style="margin-top: 10px; padding: 8px 15px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">🔄 Обновить список комнат</button>
 
         <h2>Создать комнату</h2>
         Название: <input id="roomName">
@@ -44,37 +101,429 @@
     <div id="audio-container"></div>
 
 <script>
+// ═══ CONFIGURATION ═══
+const CONFIG = {
+    // Auto-refresh intervals (in milliseconds)
+    ROOM_LIST_REFRESH_INTERVAL: 30000,  // 30 seconds for room list
+    USER_LIST_REFRESH_INTERVAL: 10000,  // 10 seconds for user list
+    VOLUME_UPDATE_INTERVAL: 100,        // 100ms for volume updates
+    
+    // Audio settings
+    VOLUME_NOISE_THRESHOLD: 2,           // Suppress volume below 2%
+    VOLUME_SPEAKING_THRESHOLD: 10,       // Consider speaking above 10%
+    
+    // WebSocket settings
+    RECONNECT_DELAY: 1000,               // 1 second delay for reconnection attempts
+};
+
+// ═══ GLOBAL VARIABLES ═══
 let myPeerId = null, myName = null, ws = null, localStream = null;
+let mainMenuWs = null; // WebSocket для главного меню
 let peerConnections = {}; // { peerId: RTCPeerConnection }
+let audioAnalyzers = {}; // { peerId: AudioAnalyzer }
+let volumeMeters = {}; // { peerId: { analyser, dataArray, lastUpdate } }
+let localAudioAnalyzer = null; // Анализатор локального микрофона
+let roomRefreshInterval = null; // Интервал обновления списка комнат
+let userRefreshInterval = null; // Интервал обновления списка пользователей
 const roomsDiv = document.getElementById('rooms');
 
-// --- Вход и создание комнат (без существенных изменений) ---
+// Функции для подключения к WebSocket главного меню
+function connectToMainMenu() {
+    if (mainMenuWs) {
+        console.log('✅ WebSocket главного меню уже подключен');
+        return;
+    }
+    
+    try {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${wsProtocol}//${location.host}/main-menu/${myPeerId}/${encodeURIComponent(myName)}`;
+        
+        mainMenuWs = new WebSocket(wsUrl);
+        
+        mainMenuWs.onopen = () => {
+            console.log('🏠 Подключение к WebSocket главного меню установлено');
+        };
+        
+        mainMenuWs.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                if (message.type === 'rooms_updated') {
+                    const eventType = message.event || 'unknown';
+                    const eventEmojis = {
+                        'room_created': '🏠',
+                        'room_deleted': '🗑️',
+                        'room_updated': '🔄'
+                    };
+                    const emoji = eventEmojis[eventType] || '📢';
+                    
+                    console.log(`${emoji} Получено уведомление о событии: ${eventType}`);
+                    loadRooms(); // Автоматически обновляем список
+                }
+            } catch (error) {
+                console.error('❌ Ошибка обработки сообщения главного меню:', error);
+            }
+        };
+        
+        mainMenuWs.onclose = () => {
+            console.log('🏠 WebSocket главного меню закрыт');
+            mainMenuWs = null;
+        };
+        
+        mainMenuWs.onerror = (error) => {
+            console.error('❌ Ошибка WebSocket главного меню:', error);
+        };
+        
+    } catch (error) {
+        console.error('❌ Ошибка подключения к WebSocket главного меню:', error);
+    }
+}
+
+function disconnectFromMainMenu() {
+    if (mainMenuWs && mainMenuWs.readyState !== WebSocket.CLOSED) {
+        console.log('🏠 Отключаемся от WebSocket главного меню');
+        mainMenuWs.close();
+        mainMenuWs = null;
+    }
+}
+function createAudioAnalyzer(stream, peerId) {
+    try {
+        // Проверяем, существует ли уже работающий анализатор
+        if (volumeMeters[peerId] && volumeMeters[peerId].isRunning) {
+            console.log(`✅ Анализатор для ${peerId} уже работает, пропускаем создание`);
+            return volumeMeters[peerId];
+        }
+        
+        // Очищаем старый анализатор только если он не работает
+        if (volumeMeters[peerId] && !volumeMeters[peerId].isRunning) {
+            console.log(`🧽 Очищаем неработающий анализатор для ${peerId}`);
+            if (volumeMeters[peerId].audioContext) {
+                volumeMeters[peerId].audioContext.close();
+            }
+            delete volumeMeters[peerId];
+        }
+        
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        
+        // Настройки для сглаживания громкости
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.85; // Увеличено для большего сглаживания
+        source.connect(analyser);
+        
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        
+        volumeMeters[peerId] = {
+            analyser: analyser,
+            dataArray: dataArray,
+            lastUpdate: 0,
+            audioContext: audioContext,
+            smoothedVolume: 0, // Для сглаживания
+            isRunning: false,
+            stream: stream // Сохраняем ссылку на поток
+        };
+        
+        console.log(`📊 Аудио анализатор создан для ${peerId}`);
+        
+        // Запускаем мониторинг громкости с небольшой задержкой
+        setTimeout(() => {
+            if (volumeMeters[peerId] && !volumeMeters[peerId].isRunning) {
+                startVolumeMonitoring(peerId);
+            }
+        }, 100);
+        
+        return { analyser, dataArray, audioContext };
+    } catch (error) {
+        console.error(`❌ Ошибка создания анализатора для ${peerId}:`, error);
+        return null;
+    }
+}
+
+function calculateVolume(analyser, dataArray) {
+    try {
+        analyser.getByteFrequencyData(dataArray);
+        
+        // Используем более современный алгоритм для расчета громкости
+        let sum = 0;
+        let sampleCount = 0;
+        
+        // Фокусируемся на частотах человеческого голоса (300Hz - 3400Hz)
+        const voiceStart = Math.floor(dataArray.length * 0.1); // Примерно 300Hz
+        const voiceEnd = Math.floor(dataArray.length * 0.7);   // Примерно 3400Hz
+        
+        for (let i = voiceStart; i < voiceEnd; i++) {
+            sum += dataArray[i] * dataArray[i]; // RMS вместо простого среднего
+            sampleCount++;
+        }
+        
+        if (sampleCount === 0) {
+            return 0;
+        }
+        
+        const rms = Math.sqrt(sum / sampleCount);
+        
+        // Нормализуем и применяем логарифмическое масштабирование
+        const normalizedRms = rms / 255;
+        const volume = Math.min(100, normalizedRms * 200); // Увеличиваем чувствительность
+        
+        // Проверяем на NaN и бесконечность
+        return isNaN(volume) || !isFinite(volume) ? 0 : volume;
+    } catch (error) {
+        console.warn('Ошибка расчета громкости:', error);
+        return 0;
+    }
+}
+
+function startVolumeMonitoring(peerId) {
+    const meter = volumeMeters[peerId];
+    if (!meter || meter.isRunning) return;
+    
+    meter.isRunning = true;
+    const { analyser, dataArray } = meter;
+    
+    // Инициализируем сглаженное значение, если оно не существует
+    if (typeof meter.smoothedVolume === 'undefined') {
+        meter.smoothedVolume = 0;
+    }
+    
+    // Счетчик для стабилизации начальных значений
+    let stabilizationCounter = 0;
+    const STABILIZATION_PERIOD = 10; // 10 итераций для стабилизации
+    
+    function updateVolume() {
+        if (!volumeMeters[peerId] || !volumeMeters[peerId].isRunning) return;
+        
+        try {
+            const rawVolume = calculateVolume(analyser, dataArray);
+            
+            // Применяем адаптивное экспоненциальное сглаживание
+            let alpha;
+            if (stabilizationCounter < STABILIZATION_PERIOD) {
+                // В начале используем большее сглаживание
+                alpha = 0.05; // Медленное сглаживание
+                stabilizationCounter++;
+            } else {
+                // После стабилизации адаптируем коэффициент
+                const volumeDiff = Math.abs(rawVolume - volumeMeters[peerId].smoothedVolume);
+                if (volumeDiff > 20) {
+                    alpha = 0.3; // Быстрое сглаживание при резких изменениях
+                } else if (volumeDiff > 5) {
+                    alpha = 0.15; // Умеренное сглаживание
+                } else {
+                    alpha = 0.08; // Медленное сглаживание при малых изменениях
+                }
+            }
+            
+            const currentSmoothed = volumeMeters[peerId].smoothedVolume;
+            const newSmoothed = currentSmoothed + alpha * (rawVolume - currentSmoothed);
+            
+            volumeMeters[peerId].smoothedVolume = newSmoothed;
+            
+            // Обновляем отображение с ограничением минимального порога
+            const displayVolume = newSmoothed < CONFIG.VOLUME_NOISE_THRESHOLD ? 0 : newSmoothed; // Подавляем шум
+            updateVolumeDisplay(peerId, displayVolume);
+            
+            // Обновляем каждые CONFIG.VOLUME_UPDATE_INTERVAL мс для плавности
+            setTimeout(updateVolume, CONFIG.VOLUME_UPDATE_INTERVAL);
+            
+        } catch (error) {
+            console.warn(`⚠️ Ошибка обновления громкости для ${peerId}:`, error);
+            // Продолжаем мониторинг даже при ошибке
+            setTimeout(updateVolume, CONFIG.VOLUME_UPDATE_INTERVAL);
+        }
+    }
+    
+    console.log(`📈 Запущен мониторинг громкости для ${peerId}`);
+    updateVolume();
+}
+
+function updateVolumeDisplay(peerId, volume) {
+    const volumeBar = document.getElementById(`volume-bar-${peerId}`);
+    const volumeText = document.getElementById(`volume-text-${peerId}`);
+    const userItem = document.getElementById(`user-item-${peerId}`);
+    
+    if (volumeBar && volumeText && userItem) {
+        // Проверяем корректность значения громкости
+        const safeVolume = isNaN(volume) || !isFinite(volume) ? 0 : Math.max(0, Math.min(100, volume));
+        
+        volumeBar.style.width = `${safeVolume}%`;
+        volumeText.textContent = `${Math.round(safeVolume)}%`;
+        
+        // Подсвечиваем при речи (более CONFIG.VOLUME_SPEAKING_THRESHOLD%)
+        if (safeVolume > CONFIG.VOLUME_SPEAKING_THRESHOLD) {
+            userItem.classList.add('speaking');
+        } else {
+            userItem.classList.remove('speaking');
+        }
+    }
+}
+
+function createUserVolumeIndicator(peerId, peerName) {
+    const userItem = document.createElement('div');
+    userItem.id = `user-item-${peerId}`;
+    userItem.className = 'user-item';
+    
+    userItem.innerHTML = `
+        <div class="user-name">${peerName}</div>
+        <div class="volume-indicator">
+            <div class="volume-bar" id="volume-bar-${peerId}"></div>
+        </div>
+        <div class="volume-text" id="volume-text-${peerId}">0%</div>
+    `;
+    
+    return userItem;
+}
+
+function removeVolumeAnalyzer(peerId) {
+    if (volumeMeters[peerId]) {
+        // Останавливаем мониторинг
+        volumeMeters[peerId].isRunning = false;
+        
+        // Закрываем AudioContext
+        if (volumeMeters[peerId].audioContext) {
+            volumeMeters[peerId].audioContext.close();
+        }
+        delete volumeMeters[peerId];
+        console.log(`🧽 Анализатор громкости удален для ${peerId}`);
+    }
+    
+    // Удаляем элемент интерфейса
+    const userItem = document.getElementById(`user-item-${peerId}`);
+    if (userItem) {
+        userItem.remove();
+    }
+}
+
+// Функция для запуска автообновления списка пользователей
+function startUserAutoRefresh() {
+    // Очищаем предыдущий интервал, если он был
+    if (userRefreshInterval) {
+        clearInterval(userRefreshInterval);
+    }
+    
+    // Обновляем каждые CONFIG.USER_LIST_REFRESH_INTERVAL миллисекунд
+    userRefreshInterval = setInterval(() => {
+        // Обновляем только если находимся в комнате и есть WebSocket соединение
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            console.log('🔄 Автообновление списка пользователей...');
+            // Отправляем запрос на обновление списка пользователей
+            ws.send(JSON.stringify({ type: 'refresh_users' }));
+        }
+    }, CONFIG.USER_LIST_REFRESH_INTERVAL);
+    
+    console.log(`✅ Автообновление списка пользователей запущено (каждые ${CONFIG.USER_LIST_REFRESH_INTERVAL/1000} секунд)`);
+}
+
+// Функция для остановки автообновления списка пользователей
+function stopUserAutoRefresh() {
+    if (userRefreshInterval) {
+        clearInterval(userRefreshInterval);
+        userRefreshInterval = null;
+        console.log('⏹️ Автообновление списка пользователей остановлено');
+    }
+}
+
+// --- Вход и создание комнат (с улучшениями) ---
 document.getElementById('enterBtn').onclick = () => {
     myName = userName.value || 'Гость' + Math.random().toString(36).slice(2, 5);
     myPeerId = `peer_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`; // Генерируем уникальный ID
     login.classList.add('hidden');
     main.classList.remove('hidden');
     loadRooms();
+    
+    // Подключаемся к WebSocket главного меню
+    connectToMainMenu();
+    
+    // Запускаем автообновление списка комнат
+    startRoomAutoRefresh();
 };
 
 document.getElementById('createRoom').onclick = async () => {
-    const r = await fetch('/api/rooms', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: roomName.value, password: roomPwd.value })
-    });
-    if (r.ok) {
-        roomName.value = ''; roomPwd.value = '';
-        loadRooms();
-    } else { alert(await r.text()); }
+    try {
+        const r = await fetch('/api/rooms', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: roomName.value, password: roomPwd.value })
+        });
+        
+        if (r.ok) {
+            const newRoom = await r.json();
+            console.log(`✅ Комната "${newRoom.name}" создана успешно!`);
+            roomName.value = ''; 
+            roomPwd.value = '';
+            // Обновляем список комнат сразу после создания
+            loadRooms();
+        } else {
+            const errorText = await r.text();
+            alert(`Ошибка создания комнаты: ${errorText}`);
+        }
+    } catch (error) {
+        console.error('Ошибка при создании комнаты:', error);
+        alert('Ошибка сети при создании комнаты.');
+    }
+};
+
+// Обработчик кнопки ручного обновления списка комнат
+document.getElementById('refreshRooms').onclick = () => {
+    console.log('🔄 Ручное обновление списка комнат...');
+    loadRooms();
 };
 
 async function loadRooms() {
-    roomsDiv.innerHTML = 'Загрузка...';
-    const lst = await (await fetch('/api/rooms')).json();
-    roomsDiv.innerHTML = lst.map(r =>
-        `<button onclick="join(${r.id},'${r.name}',${r.has_password})">
-       Войти: ${r.name}${r.has_password ? ' 🔒' : ''}</button>`).join('<br>');
+    try {
+        roomsDiv.innerHTML = '🔄 Загрузка списка комнат...';
+        const response = await fetch('/api/rooms');
+        
+        if (!response.ok) {
+            throw new Error(`Ошибка загрузки: ${response.status}`);
+        }
+        
+        const lst = await response.json();
+        
+        if (lst.length === 0) {
+            roomsDiv.innerHTML = '🏠 Комнат пока нет. Создайте первую!';
+        } else {
+            roomsDiv.innerHTML = lst.map(r =>
+                `<button onclick="join(${r.id},'${r.name}',${r.has_password})" style="display: block; width: 100%; margin: 5px 0; padding: 10px; text-align: left; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; cursor: pointer;" onmouseover="this.style.background='#e9ecef'" onmouseout="this.style.background='#f8f9fa'">
+                💬 ${r.name}${r.has_password ? ' 🔒' : ' 🔓'}
+                </button>`
+            ).join('');
+        }
+        
+        console.log(`✅ Список комнат обновлен. Количество: ${lst.length}`);
+        
+    } catch (error) {
+        console.error('❌ Ошибка загрузки списка комнат:', error);
+        roomsDiv.innerHTML = `❌ Ошибка загрузки списка комнат: ${error.message}`;
+    }
+}
+
+// Функция для запуска автообновления списка комнат
+function startRoomAutoRefresh() {
+    // Очищаем предыдущий интервал, если он был
+    if (roomRefreshInterval) {
+        clearInterval(roomRefreshInterval);
+    }
+    
+    // Обновляем каждые CONFIG.ROOM_LIST_REFRESH_INTERVAL миллисекунд
+    roomRefreshInterval = setInterval(() => {
+        // Обновляем только если не находимся в комнате
+        if (!ws) {
+            console.log('🔄 Автообновление списка комнат...');
+            loadRooms();
+        }
+    }, CONFIG.ROOM_LIST_REFRESH_INTERVAL);
+    
+    console.log(`✅ Автообновление списка комнат запущено (каждые ${CONFIG.ROOM_LIST_REFRESH_INTERVAL/1000} секунд)`);
+}
+
+// Функция для остановки автообновления списка комнат
+function stopRoomAutoRefresh() {
+    if (roomRefreshInterval) {
+        clearInterval(roomRefreshInterval);
+        roomRefreshInterval = null;
+        console.log('⏹️ Автообновление списка комнат остановлено');
+    }
 }
 
 
@@ -99,6 +548,14 @@ window.join = async (id, name, hasPwd) => {
             console.log("WebSocket connection established");
             callUI.classList.remove('hidden');
             currentRoom.textContent = name;
+            
+            // Останавливаем автообновление комнат и запускаем для пользователей
+            stopRoomAutoRefresh();
+            
+            // Отключаемся от WebSocket главного меню
+            disconnectFromMainMenu();
+            
+            startUserAutoRefresh();
         };
         
         ws.onmessage = e => handleWsMessage(JSON.parse(e.data));
@@ -135,21 +592,54 @@ async function handleWsMessage(msg) {
     switch (type) {
         // Сервер сообщил нам, кто уже есть в комнате
         case 'room_state':
-            updateUsersList(payload.concat({id: myPeerId, name: `${myName} (Вы)`}));
-            // Создаем соединение с каждым существующим пиром и отправляем offer
-            for (const peer of payload) {
+            // Фильтруем себя из списка других пользователей и добавляем отдельно
+            const otherUsers = payload.filter(peer => peer.id !== myPeerId);
+            const allUsers = otherUsers.concat({id: myPeerId, name: `${myName} (Вы)`});
+            updateUsersList(allUsers);
+            
+            // Создаем соединение только с новыми пирами (не с существующими)
+            for (const peer of otherUsers) {
+                // Проверяем, существует ли уже соединение с этим пиром
+                if (peerConnections[peer.id]) {
+                    console.log(`✅ Соединение с ${peer.name} (${peer.id}) уже существует, пропускаем`);
+                    continue;
+                }
+                
+                console.log(`🔗 Создаем соединение с НОВЫМ пиром: ${peer.name} (${peer.id})`);
                 const pc = createPeerConnection(peer.id, peer.name);
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                ws.send(JSON.stringify({ to_id: peer.id, type: 'sdp', payload: pc.localDescription }));
+                
+                // Проверяем, что треки добавлены перед созданием offer
+                const senders = pc.getSenders();
+                console.log(`📤 Отправители перед созданием offer для ${peer.name}:`, senders.length);
+                
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    console.log(`📞 Отправляем offer для НОВОГО участника ${peer.name}`);
+                    ws.send(JSON.stringify({ to_id: peer.id, type: 'sdp', payload: pc.localDescription }));
+                } catch (error) {
+                    console.error(`❌ Ошибка создания offer для ${peer.name}:`, error);
+                }
             }
             break;
 
         // В комнату вошел новый участник
         case 'new_peer':
+            // Не добавляем себя в список и не создаем соединение с собой
+            if (payload.id === myPeerId) {
+                console.log(`⏭️ Игнорируем уведомление о собственном подключении: ${payload.name}`);
+                break;
+            }
+            
             updateUsersList(null, payload);
+            
             // Новый участник создаст offer, мы просто создаем PC и ждем
-            createPeerConnection(payload.id, payload.name);
+            console.log(`👋 Новый участник присоединился: ${payload.name} (${payload.id})`);
+            const newPc = createPeerConnection(payload.id, payload.name);
+            
+            // Проверяем, что локальные треки добавлены
+            const senders = newPc.getSenders();
+            console.log(`📤 Отправители для нового участника ${payload.name}:`, senders.length);
             break;
 
         // Участник покинул комнату
@@ -165,30 +655,96 @@ async function handleWsMessage(msg) {
 
         // Получили SDP (offer или answer)
         case 'sdp':
+            // Не обрабатываем SDP от самого себя
+            if (from_id === myPeerId) {
+                console.log(`⏭️ Пропускаем обработку SDP от самого себя: ${from_id}`);
+                break;
+            }
+            
             const pc = peerConnections[from_id];
             if (pc) {
-                await pc.setRemoteDescription(new RTCSessionDescription(payload));
-                if (payload.type === 'offer') {
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-                    ws.send(JSON.stringify({ to_id: from_id, type: 'sdp', payload: pc.localDescription }));
+                try {
+                    console.log(`📨 Получен ${payload.type} от ${from_id}`);
+                    await pc.setRemoteDescription(new RTCSessionDescription(payload));
+                    if (payload.type === 'offer') {
+                        console.log(`📝 Создаем answer для ${from_id}`);
+                        const answer = await pc.createAnswer();
+                        await pc.setLocalDescription(answer);
+                        ws.send(JSON.stringify({ to_id: from_id, type: 'sdp', payload: pc.localDescription }));
+                        console.log(`📤 Answer отправлен для ${from_id}`);
+                    }
+                } catch (error) {
+                    console.error(`❌ Ошибка обработки SDP от ${from_id}:`, error);
                 }
+            } else {
+                console.error(`❌ Не найдено PeerConnection для ${from_id}`);
             }
             break;
 
         // Получили ICE-кандидат
         case 'ice':
-            await peerConnections[from_id]?.addIceCandidate(new RTCIceCandidate(payload));
+            // Не обрабатываем ICE кандидаты от самого себя
+            if (from_id === myPeerId) {
+                console.log(`⏭️ Пропускаем обработку ICE кандидата от самого себя: ${from_id}`);
+                break;
+            }
+            
+            const peerConn = peerConnections[from_id];
+            if (peerConn) {
+                try {
+                    console.log(`🧊 Добавляем ICE кандидат от ${from_id}:`, payload.type);
+                    await peerConn.addIceCandidate(new RTCIceCandidate(payload));
+                } catch (error) {
+                    console.error(`❌ Ошибка добавления ICE кандидата от ${from_id}:`, error);
+                }
+            } else {
+                console.error(`❌ Не найдено PeerConnection для добавления ICE кандидата от ${from_id}`);
+            }
             break;
     }
 }
 
 function createPeerConnection(peerId, peerName) {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // Проверяем, существует ли уже соединение
+    if (peerConnections[peerId]) {
+        console.log(`✅ Переиспользуем существующее PeerConnection для ${peerName} (${peerId})`);
+        return peerConnections[peerId];
+    }
+    
+    const pc = new RTCPeerConnection({ 
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+    });
+    
+    // Обработчики состояний соединения
+    pc.onconnectionstatechange = () => {
+        console.log(`Состояние соединения с ${peerName}: ${pc.connectionState}`);
+        if (pc.connectionState === 'failed') {
+            console.error(`Ошибка соединения с ${peerName}`);
+        } else if (pc.connectionState === 'connected') {
+            console.log(`Успешное соединение с ${peerName}`);
+        }
+    };
+    
+    pc.oniceconnectionstatechange = () => {
+        console.log(`ICE состояние с ${peerName}: ${pc.iceConnectionState}`);
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+            console.warn(`Проблемы с ICE соединением к ${peerName}`);
+        }
+    };
+    
+    pc.onicegatheringstatechange = () => {
+        console.log(`ICE gathering состояние с ${peerName}: ${pc.iceGatheringState}`);
+    };
     
     pc.onicecandidate = ({ candidate }) => {
         if (candidate) {
+            console.log(`Отправка ICE кандидата к ${peerName}:`, candidate.type);
             ws.send(JSON.stringify({ to_id: peerId, type: 'ice', payload: candidate }));
+        } else {
+            console.log(`Сбор ICE кандидатов завершен для ${peerName}`);
         }
     };
     
@@ -199,14 +755,93 @@ function createPeerConnection(peerId, peerName) {
             audioEl.id = `audio_${peerId}`;
             audioEl.autoplay = true;
             audioEl.playsInline = true;
+            audioEl.volume = 1.0;
+            // Добавляем обработчики для отладки
+            audioEl.onloadedmetadata = () => {
+                console.log(`Метаданные аудио загружены для ${peerName} (${peerId})`);
+                audioEl.play().catch(err => {
+                    console.warn(`Автовоспроизведение заблокировано для ${peerName}:`, err);
+                    // Показываем кнопку для ручного запуска
+                    showPlayButton(peerId, peerName, audioEl);
+                });
+            };
+            audioEl.onplay = () => console.log(`▶️ Аудио начало воспроизводиться для ${peerName}`);
+            audioEl.onpause = () => console.log(`⏸️ Аудио приостановлено для ${peerName}`);
+            audioEl.onerror = (err) => {
+                console.error(`❌ Ошибка аудио для ${peerName}:`, err);
+                // Пробуем перезапустить аудио
+                setTimeout(() => {
+                    console.log(`🔄 Попытка перезапуска аудио для ${peerName}`);
+                    audioEl.load();
+                    audioEl.play().catch(e => console.warn('Не удалось перезапустить:', e));
+                }, 1000);
+            };
             document.getElementById('audio-container').appendChild(audioEl);
         }
         audioEl.srcObject = stream;
         console.log(`Получен аудипоток от ${peerName} (${peerId})`);
+        
+        // Проверяем, есть ли аудиотреки в потоке
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length === 0) {
+            console.warn(`⚠️ Нет аудиотреков в потоке от ${peerName}`);
+        } else {
+            console.log(`🎤 Получено ${audioTracks.length} аудиотрек(ов) от ${peerName}`);
+            audioTracks.forEach((track, idx) => {
+                // Отслеживаем состояние трека
+                track.onended = () => {
+                    console.warn(`⚠️ Аудиотрек от ${peerName} завершился`);
+                };
+                track.onmute = () => console.warn(`🔇 Аудиотрек от ${peerName} замучен`);
+                track.onunmute = () => console.log(`🔊 Аудиотрек от ${peerName} размучен`);
+            });
+            
+            // Создаем анализатор громкости с увеличенной задержкой для стабилизации
+            setTimeout(() => {
+                // Проверяем, что поток все еще активен и анализатор не существует
+                if (stream.active && (!volumeMeters[peerId] || !volumeMeters[peerId].isRunning)) {
+                    console.log(`🔊 Создаем анализатор для стабилизированного потока ${peerId}`);
+                    createAudioAnalyzer(stream, peerId);
+                } else {
+                    console.log(`⚠️ Поток неактивен или анализатор уже существует для ${peerId}`);
+                }
+            }, 1000); // Увеличиваем до 1 секунды для лучшей стабилизации
+        }
     };
 
     // Добавляем наши аудиотреки в соединение
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    if (localStream) {
+        const audioTracks = localStream.getAudioTracks();
+        if (audioTracks.length > 0) {
+            audioTracks.forEach(track => {
+                console.log(`Добавляем аудио трек в соединение с ${peerName}:`, {
+                    kind: track.kind,
+                    enabled: track.enabled,
+                    readyState: track.readyState,
+                    label: track.label
+                });
+                pc.addTrack(track, localStream);
+            });
+            console.log(`✅ Успешно добавлено ${audioTracks.length} аудио треков для ${peerName}`);
+        } else {
+            console.error(`❌ Нет аудио треков в локальном потоке для ${peerName}`);
+        }
+    } else {
+        console.error(`❌ Локальный поток не найден при создании соединения с ${peerName}`);
+        // Попробуем получить локальный поток заново
+        console.log('Попытка повторного получения локального потока...');
+        startMedia().then(() => {
+            if (localStream) {
+                const audioTracks = localStream.getAudioTracks();
+                audioTracks.forEach(track => {
+                    console.log(`🔄 Повторно добавляем трек для ${peerName}`);
+                    pc.addTrack(track, localStream);
+                });
+            }
+        }).catch(err => {
+            console.error('Не удалось получить локальный поток:', err);
+        });
+    }
 
     peerConnections[peerId] = pc;
     console.log(`Создано PeerConnection для ${peerName} (${peerId})`);
@@ -223,19 +858,163 @@ function updateUsersList(fullList, newUser, removedUserId) {
         currentUsers.push(newUser);
     } else if (removedUserId) {
         currentUsers = currentUsers.filter(u => u.id !== removedUserId);
+        // Удаляем анализатор громкости
+        removeVolumeAnalyzer(removedUserId);
     }
     
-    usersList.innerHTML = currentUsers.map(u => `<div>${u.name}</div>`).join('');
+    // Получаем список существующих элементов UI
+    const existingUserElements = Array.from(usersList.children);
+    const existingUserIds = existingUserElements.map(el => {
+        const match = el.id.match(/user-item-(.+)/);
+        return match ? match[1] : null;
+    }).filter(Boolean);
+    
+    // Удаляем элементы для пользователей, которых больше нет
+    const currentUserIds = currentUsers.map(u => u.id);
+    existingUserIds.forEach(userId => {
+        if (!currentUserIds.includes(userId)) {
+            const element = document.getElementById(`user-item-${userId}`);
+            if (element) {
+                console.log(`🗑️ Удаляем UI элемент для ${userId}`);
+                element.remove();
+            }
+        }
+    });
+    
+    // Создаем или обновляем элементы для каждого пользователя
+    currentUsers.forEach(user => {
+        let userItem = document.getElementById(`user-item-${user.id}`);
+        if (!userItem) {
+            // Создаем новый элемент
+            userItem = createUserVolumeIndicator(user.id, user.name);
+            usersList.appendChild(userItem);
+            console.log(`➕ Создан UI элемент для ${user.name} (${user.id})`);
+            
+            // Для локального пользователя создаем анализатор микрофона
+            if (user.id === myPeerId && localStream && !localAudioAnalyzer) {
+                createLocalAudioAnalyzer();
+            }
+        } else {
+            // Обновляем существующий элемент (имя могло измениться)
+            const nameElement = userItem.querySelector('.user-name');
+            if (nameElement && nameElement.textContent !== user.name) {
+                nameElement.textContent = user.name;
+                console.log(`🔄 Обновлено имя для ${user.id}: ${user.name}`);
+            }
+        }
+    });
 }
 
 
 async function startMedia() {
     if (!localStream) {
-        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        try {
+            console.log('Запрашиваем доступ к микрофону...');
+            localStream = await navigator.mediaDevices.getUserMedia({ 
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }
+            });
+            console.log('Микрофон успешно захвачен');
+            console.log('Аудиотреки:', localStream.getAudioTracks().map(t => ({
+                kind: t.kind,
+                enabled: t.enabled,
+                readyState: t.readyState,
+                label: t.label
+            })));
+        } catch (error) {
+            console.error('Ошибка доступа к микрофону:', error);
+            throw error;
+        }
     }
 }
 
+function createLocalAudioAnalyzer() {
+    if (localStream && myPeerId && !localAudioAnalyzer) {
+        try {
+            console.log('🎤 Создаем локальный анализатор аудио...');
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(localStream);
+            const analyser = audioContext.createAnalyser();
+            
+            analyser.fftSize = 256;
+            analyser.smoothingTimeConstant = 0.85;
+            source.connect(analyser);
+            
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            
+            localAudioAnalyzer = {
+                analyser: analyser,
+                dataArray: dataArray,
+                audioContext: audioContext,
+                smoothedVolume: 0,
+                isRunning: false
+            };
+            
+            // Также добавляем в общий volumeMeters для единообразия
+            volumeMeters[myPeerId] = localAudioAnalyzer;
+            
+            console.log('✅ Локальный анализатор аудио создан');
+            startVolumeMonitoring(myPeerId);
+            
+            // Принудительно добавляем треки во все существующие соединения
+            ensureTracksInAllConnections();
+            
+        } catch (error) {
+            console.error('❌ Ошибка создания локального анализатора:', error);
+        }
+    } else if (localAudioAnalyzer) {
+        console.log('✅ Локальный анализатор уже существует');
+        // Убеждаемся что мониторинг запущен
+        if (!localAudioAnalyzer.isRunning) {
+            startVolumeMonitoring(myPeerId);
+        }
+    }
+}
+
+// Функция для принудительного добавления треков во все peer connections
+function ensureTracksInAllConnections() {
+    if (!localStream) {
+        console.warn('⚠️ Нет локального потока для добавления треков');
+        return;
+    }
+    
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+        console.warn('⚠️ Нет аудио треков в локальном потоке');
+        return;
+    }
+    
+    console.log('🔄 Проверяем треки во всех peer connections...');
+    
+    Object.entries(peerConnections).forEach(([peerId, pc]) => {
+        const senders = pc.getSenders();
+        const audioSenders = senders.filter(sender => sender.track && sender.track.kind === 'audio');
+        
+        console.log(`PC ${peerId}: ${audioSenders.length} аудио отправителей из ${senders.length} общих`);
+        
+        if (audioSenders.length === 0) {
+            console.log(`➕ Добавляем недостающие аудио треки для ${peerId}`);
+            audioTracks.forEach(track => {
+                try {
+                    pc.addTrack(track, localStream);
+                    console.log(`✅ Трек добавлен для ${peerId}:`, track.label);
+                } catch (error) {
+                    console.error(`❌ Ошибка добавления трека для ${peerId}:`, error);
+                }
+            });
+        } else {
+            console.log(`✅ Треки уже добавлены для ${peerId}`);
+        }
+    });
+}
+
 function cleanup() {
+    // Останавливаем автообновление пользователей
+    stopUserAutoRefresh();
+    
     // Закрываем все WebRTC соединения
     for (const peerId in peerConnections) {
         peerConnections[peerId].close();
@@ -253,6 +1032,18 @@ function cleanup() {
     // Останавливаем захват микрофона
     localStream?.getTracks().forEach(track => track.stop());
     localStream = null;
+    
+    // Очищаем анализаторы громкости
+    Object.keys(volumeMeters).forEach(peerId => {
+        removeVolumeAnalyzer(peerId);
+    });
+    volumeMeters = {};
+    
+    // Очищаем локальный анализатор
+    if (localAudioAnalyzer && localAudioAnalyzer.audioContext) {
+        localAudioAnalyzer.audioContext.close();
+    }
+    localAudioAnalyzer = null;
 
     // Скрываем UI звонка
     callUI.classList.add('hidden');
@@ -260,6 +1051,14 @@ function cleanup() {
     usersList.innerHTML = '';
     document.getElementById('audio-container').innerHTML = '';
     currentUsers = [];
+    
+    // Возобновляем автообновление списка комнат
+    startRoomAutoRefresh();
+    
+    // Переподключаемся к WebSocket главного меню
+    connectToMainMenu();
+    
+    console.log('🧹 Очистка завершена, возвращение к списку комнат');
 }
 
 leave.onclick = () => { cleanup(); };
@@ -270,6 +1069,221 @@ muteMic.onclick = () => {
         muteMic.textContent = enabled ? "Микрофон вкл." : "Микрофон выкл.";
     }
 };
+
+// Функция для показа кнопки воспроизведения при блокировке автоплея
+function showPlayButton(peerId, peerName, audioEl) {
+    const existingBtn = document.getElementById(`play_${peerId}`);
+    if (existingBtn) return; // Кнопка уже существует
+    
+    const playBtn = document.createElement('button');
+    playBtn.id = `play_${peerId}`;
+    playBtn.textContent = `▶️ Воспроизвести звук от ${peerName}`;
+    playBtn.style.margin = '5px';
+    playBtn.style.padding = '10px';
+    playBtn.style.backgroundColor = '#4CAF50';
+    playBtn.style.color = 'white';
+    playBtn.style.border = 'none';
+    playBtn.style.borderRadius = '4px';
+    playBtn.style.cursor = 'pointer';
+    
+    playBtn.onclick = async () => {
+        try {
+            await audioEl.play();
+            playBtn.remove();
+            console.log(`Ручной запуск воспроизведения для ${peerName} успешен`);
+        } catch (err) {
+            console.error(`Не удалось запустить воспроизведение для ${peerName}:`, err);
+            alert(`Не удалось воспроизвести звук от ${peerName}. Проверьте настройки браузера.`);
+        }
+    };
+    
+    document.getElementById('usersList').appendChild(playBtn);
+}
+
+// Функция для диагностики аудио проблем
+function diagnoseAudio() {
+    console.log('===============================================');
+    console.log('🔍 ДИАГНОСТИКА АУДИО');
+    console.log('===============================================');
+    
+    // 1. Локальный поток
+    console.log('\n1️⃣ ЛОКАЛЬНЫЙ ПОТОК:');
+    console.log('Локальный поток:', localStream);
+    if (localStream) {
+        const tracks = localStream.getTracks();
+        const audioTracks = localStream.getAudioTracks();
+        console.log(`✅ Общие треки: ${tracks.length}, Аудио треки: ${audioTracks.length}`);
+        audioTracks.forEach((track, idx) => {
+            console.log(`  🎤 Аудио трек ${idx}:`, {
+                enabled: track.enabled,
+                readyState: track.readyState,
+                label: track.label,
+                kind: track.kind,
+                muted: track.muted
+            });
+        });
+    } else {
+        console.log('❌ Локальный поток ОТСУТСТВУЕТ!');
+    }
+    
+    // 2. Peer Connections
+    console.log('\n2️⃣ PEER CONNECTIONS:');
+    const peerIds = Object.keys(peerConnections);
+    console.log(`Количество соединений: ${peerIds.length}`);
+    
+    if (peerIds.length === 0) {
+        console.log('⚠️ Нет активных peer connections!');
+    }
+    
+    peerIds.forEach(peerId => {
+        const pc = peerConnections[peerId];
+        console.log(`\n  🔗 PC ${peerId}:`);
+        console.log(`    Состояние: ${pc.connectionState}`);
+        console.log(`    ICE: ${pc.iceConnectionState}`);
+        console.log(`    Сигналинг: ${pc.signalingState}`);
+        
+        // Отправители (наши треки)
+        const senders = pc.getSenders();
+        const audioSenders = senders.filter(s => s.track && s.track.kind === 'audio');
+        console.log(`    📤 Отправители: ${senders.length} (аудио: ${audioSenders.length})`);
+        audioSenders.forEach((sender, idx) => {
+            console.log(`      🎤 Отправитель ${idx}:`, {
+                enabled: sender.track.enabled,
+                readyState: sender.track.readyState,
+                label: sender.track.label
+            });
+        });
+        
+        // Получатели (треки от других)
+        const receivers = pc.getReceivers();
+        const audioReceivers = receivers.filter(r => r.track && r.track.kind === 'audio');
+        console.log(`    📥 Получатели: ${receivers.length} (аудио: ${audioReceivers.length})`);
+        audioReceivers.forEach((receiver, idx) => {
+            console.log(`      🎬 Получатель ${idx}:`, {
+                enabled: receiver.track.enabled,
+                readyState: receiver.track.readyState,
+                label: receiver.track.label
+            });
+        });
+        
+        if (audioSenders.length === 0) {
+            console.log(`    ❌ ПРОБЛЕМА: Нет аудио отправителей!`);
+        }
+        if (audioReceivers.length === 0) {
+            console.log(`    ⚠️ Нет аудио получателей`);
+        }
+    });
+    
+    // 3. Аудио элементы
+    console.log('\n3️⃣ АУДИО ЭЛЕМЕНТЫ:');
+    const audioElements = document.querySelectorAll('audio');
+    console.log(`Количество аудио элементов: ${audioElements.length}`);
+    audioElements.forEach((audio, idx) => {
+        console.log(`  🔊 Элемент ${idx} (${audio.id}):`, {
+            srcObject: !!audio.srcObject,
+            paused: audio.paused,
+            volume: audio.volume,
+            muted: audio.muted,
+            readyState: audio.readyState,
+            currentTime: audio.currentTime,
+            duration: audio.duration
+        });
+        
+        if (audio.srcObject) {
+            const stream = audio.srcObject;
+            const tracks = stream.getTracks();
+            console.log(`    Поток: ${tracks.length} треков`);
+            tracks.forEach(track => {
+                console.log(`      ${track.kind}: ${track.enabled}, ${track.readyState}`);
+            });
+        }
+    });
+    
+    // 4. Анализаторы громкости
+    console.log('\n4️⃣ АНАЛИЗАТОРЫ ГРОМКОСТИ:');
+    const analyzerIds = Object.keys(volumeMeters);
+    console.log(`Количество анализаторов: ${analyzerIds.length}`);
+    analyzerIds.forEach(peerId => {
+        const meter = volumeMeters[peerId];
+        console.log(`  📊 ${peerId}:`, {
+            audioContext: meter.audioContext ? meter.audioContext.state : 'null',
+            analyser: !!meter.analyser,
+            dataArrayLength: meter.dataArray ? meter.dataArray.length : 0
+        });
+    });
+    
+    console.log(`Локальный анализатор: ${!!localAudioAnalyzer}`);
+    
+    // 5. Общая сводка
+    console.log('\n5️⃣ СВОДКА:');
+    console.log(`✅ Локальный поток: ${!!localStream}`);
+    console.log(`✅ Peer connections: ${peerIds.length}`);
+    console.log(`✅ Аудио элементы: ${audioElements.length}`);
+    console.log(`✅ Анализаторы: ${analyzerIds.length}`);
+    
+    // Проверяем основные проблемы
+    console.log('\n🔴 ОБНАРУЖЕННЫЕ ПРОБЛЕМЫ:');
+    let problemsFound = 0;
+    
+    if (!localStream) {
+        console.log('❌ Отсутствует локальный поток!');
+        problemsFound++;
+    } else if (localStream.getAudioTracks().length === 0) {
+        console.log('❌ Нет аудио треков в локальном потоке!');
+        problemsFound++;
+    }
+    
+    peerIds.forEach(peerId => {
+        const pc = peerConnections[peerId];
+        const audioSenders = pc.getSenders().filter(s => s.track && s.track.kind === 'audio');
+        if (audioSenders.length === 0) {
+            console.log(`❌ ${peerId}: Нет аудио отправителей!`);
+            problemsFound++;
+        }
+    });
+    
+    if (problemsFound === 0) {
+        console.log('✅ Критических проблем не обнаружено');
+    } else {
+        console.log(`❌ Обнаружено ${problemsFound} проблем(ы)`);
+        console.log('\n💡 РЕКОМЕНДАЦИИ:');
+        console.log('1. Нажмите кнопку "Синхронизировать треки"');
+        console.log('2. Перезагрузите страницу и повторите подключение');
+        console.log('3. Проверьте разрешения микрофона в браузере');
+    }
+    
+    console.log('===============================================');
+}
+
+// Добавляем кнопку диагностики в интерфейс
+const diagBtn = document.createElement('button');
+diagBtn.textContent = '🔍 Диагностика аудио';
+diagBtn.onclick = diagnoseAudio;
+diagBtn.style.margin = '5px';
+document.getElementById('controls').appendChild(diagBtn);
+
+// Добавляем кнопку для принудительной синхронизации треков
+const syncBtn = document.createElement('button');
+syncBtn.textContent = '🔄 Синхронизировать треки';
+syncBtn.onclick = () => {
+    console.log('🔄 Принудительная синхронизация треков...');
+    ensureTracksInAllConnections();
+    
+    // Перезапускаем локальный анализатор если нужно
+    if (localStream && myPeerId && !localAudioAnalyzer) {
+        createLocalAudioAnalyzer();
+    }
+    
+    alert('Синхронизация треков выполнена. Проверьте консоль браузера для деталей.');
+};
+syncBtn.style.margin = '5px';
+syncBtn.style.backgroundColor = '#FF9800';
+syncBtn.style.color = 'white';
+syncBtn.style.border = 'none';
+syncBtn.style.padding = '8px 12px';
+syncBtn.style.borderRadius = '4px';
+syncBtn.style.cursor = 'pointer';
+document.getElementById('controls').appendChild(syncBtn);
 
 </script>
 </body>
