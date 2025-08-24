@@ -128,6 +128,13 @@ class ConnectionManager:
                 print(f"🔄 Обновлена активность комнаты {room.name} (ID: {room_id})")
         finally:
             db.close()
+            
+    async def keep_room_alive(self, room_id: int):
+        """Обновляем активность комнаты если в ней есть пользователи"""
+        if room_id in self.rooms and len(self.rooms[room_id]) > 0:
+            await self.update_room_activity(room_id)
+            return True
+        return False
     
     async def cleanup_empty_rooms(self):
         """Удаляем пустые комнаты, неактивные более config.ROOM_CLEANUP_TIMEOUT_SECONDS секунд"""
@@ -148,13 +155,19 @@ class ConnectionManager:
                     last_activity_timestamp = room.last_activity.timestamp() if room.last_activity else 0
                     
                     if last_activity_timestamp < cutoff_time:
-                        print(f"🗑️ Удаляем пустую комнату: {room.name} (ID: {room.id})")
-                        db.delete(room)
-                        rooms_deleted = True
+                        # ДВОЙНАЯ ПРОВЕРКА: убеждаемся что комната все еще пустая перед удалением
+                        double_check_has_users = room.id in self.rooms and len(self.rooms[room.id]) > 0
                         
-                        # Удаляем из памяти, если есть
-                        if room.id in self.rooms:
-                            del self.rooms[room.id]
+                        if not double_check_has_users:
+                            print(f"🗑️ Удаляем пустую комнату: {room.name} (ID: {room.id})")
+                            db.delete(room)
+                            rooms_deleted = True
+                            
+                            # Удаляем из памяти, если есть
+                            if room.id in self.rooms:
+                                del self.rooms[room.id]
+                        else:
+                            print(f"⚠️ Комната {room.name} (ID: {room.id}) больше не пустая, пропускаем удаление")
             
             db.commit()
             
@@ -218,11 +231,30 @@ async def cleanup_task():
         except Exception as e:
             print(f"❌ Ошибка в фоновой задаче очистки: {e}")
 
-# Запускаем фоновую задачу при старте приложения
+# Фоновая задача для поддержания активности комнат
+async def keep_alive_task():
+    """Периодически обновляем активность всех комнат с пользователями"""
+    while True:
+        try:
+            # Обновляем каждые 30 секунд (меньше чем таймаут удаления)
+            keep_alive_interval = min(30, config.ROOM_CLEANUP_TIMEOUT_SECONDS // 2)
+            await asyncio.sleep(keep_alive_interval)
+            
+            # Обновляем активность всех комнат с пользователями
+            active_rooms = list(manager.rooms.keys())
+            for room_id in active_rooms:
+                if room_id in manager.rooms and len(manager.rooms[room_id]) > 0:
+                    await manager.keep_room_alive(room_id)
+                    
+        except Exception as e:
+            print(f"❌ Ошибка в фоновой задаче keep-alive: {e}")
+
+# Запускаем фоновые задачи при старте приложения
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(cleanup_task())
-    print(f"🚀 Фоновая задача очистки комнат запущена")
+    asyncio.create_task(keep_alive_task())
+    print(f"🚀 Фоновые задачи запущены: очистка + keep-alive")
     print(f"⚙️ Конфигурация: таймаут удаления комнат - {config.ROOM_CLEANUP_TIMEOUT_SECONDS}с, интервал проверки - {config.ROOM_CLEANUP_INTERVAL_SECONDS}с")
 
 # ─── WebSocket для главного меню ──────────────────────────────────
@@ -280,6 +312,9 @@ async def websocket_endpoint(ws: WebSocket, room_id: int, peer_id: str, user_nam
         while True:
             # Ожидаем сообщения для ретрансляции
             data = await ws.receive_json()
+            
+            # Обновляем активность комнаты при каждом сообщении
+            await manager.keep_room_alive(room_id)
             
             # Обработка специальных команд
             if data.get("type") == "refresh_users":
